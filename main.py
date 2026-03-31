@@ -824,11 +824,11 @@ def webhook():
 
     return 'OK', 200
 
-# ==================== SELF-PING MECHANISM ====================
+# ==================== SELF-PING MECHANISM (every 4 minutes) ====================
 def keep_alive(port):
     """Periodically ping the health endpoint to keep Render instance alive."""
     while True:
-        time.sleep(300)  # 5 minutes
+        time.sleep(240)  # 4 minutes (240 seconds)
         try:
             # Ping localhost (inside container) – this counts as activity on Render
             response = requests.get(f'http://localhost:{port}/health', timeout=10)
@@ -864,11 +864,11 @@ def main():
     bot_thread.start()
     logger.info("✅ Bot webhook setup thread started")
 
-    # Start self-ping thread
+    # Start self-ping thread (every 4 minutes)
     port = int(os.environ.get("PORT", 5000))
     ping_thread = threading.Thread(target=keep_alive, args=(port,), daemon=True)
     ping_thread.start()
-    logger.info("✅ Self-ping thread started (every 5 minutes)")
+    logger.info("✅ Self-ping thread started (every 4 minutes)")
 
     # Start Flask server (main thread)
     logger.info(f"🌐 Flask server starting on port {port}")
