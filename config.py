@@ -1,5 +1,4 @@
 # config.py - Complete configuration for OSINT Pro Bot on Render
-# 🔐 Use environment variables for sensitive data (BOT_TOKEN, OWNER_ID, etc.)
 
 import os
 
@@ -188,6 +187,5 @@ CMD_LIST_FOOTER = "\n\n───────────────────
 REDIRECT_BOT = "@osintfatherNullBot"
 
 # ==================== WEBHOOK ====================
-# Render dashboard mein environment variable set karo: WEBHOOK_URL
-# Example: https://osint-1-q86d.onrender.com/webhook
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+# Webhook URL hardcoded – environment variable ki zaroorat nahi
+WEBHOOK_URL = "https://grp-xk6x.onrender.com/webhook"
