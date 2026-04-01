@@ -881,7 +881,7 @@ def webhook():
 def self_ping_worker():
     """Background thread that pings the health endpoint every 5 minutes."""
     # Use the public Render URL (from environment or fallback)
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://grp-xk6x.onrender.com")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://grp-fa8h.onrender.com")
     health_url = f"{render_url}/health"
     logger.info(f"Self-ping worker started. Will ping {health_url} every 5 minutes.")
     while True:
@@ -935,7 +935,7 @@ def main():
 
     # Set webhook after bot is ready (give it a few seconds)
     time.sleep(2)
-    webhook_url = f"https://grp-xk6x.onrender.com/webhook"  # Your Render URL
+    webhook_url = f"https://grp-fa8h.onrender.com/webhook"  # Your Render URL
     set_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
         resp = requests.post(set_webhook_url, data={"url": webhook_url})
