@@ -76,7 +76,7 @@ COMMANDS = {
   '"owner": "@Ayano_mindx",',
   '"admin": "@anuragxanuu",',
   '"help_group": "https://t.me/hackedanurag",',
-  '"note": "brother"', '9277193139']
+  '"note": "brother",', '9277193139']
     },
     "vehicle": {
         "url": "https://vehicle-info-aco-api.vercel.app/info?vehicle={}",
