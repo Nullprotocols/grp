@@ -171,7 +171,7 @@ COMMANDS = {
   '"owner": "@Ayano_mindx",',
   '"admin": "@anuragxanuu",',
   '"help_group": "https://t.me/hackedanurag",',
-  '"note": "brother"', '9277193139']
+  '"note": "brother",', '9277193139']
     },
     "git": {
         "url": "https://abbas-apis.vercel.app/api/github?username={}",
