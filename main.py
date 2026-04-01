@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py - OSINT Pro Bot with Webhook + Self-Ping (No sleep on Render)
+# main.py - OSINT Pro Bot with Webhook + Self-Ping for Render
 
 import os
 import sys
@@ -11,11 +11,11 @@ import asyncio
 import logging
 import threading
 import html
+import requests  # <-- for webhook set and self-ping
 import aiosqlite
 import aiohttp
-import requests
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatMemberHandler,
@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 
 flask_app = Flask(__name__)
 
-# Global bot application and event loop (for webhook)
+# ==================== GLOBALS ====================
+# Create the bot application globally so we can feed updates into it.
 bot_app = None
-bot_loop = None
+asyncio_loop = None  # Will hold the asyncio loop used by the bot
 
 # ==================== CONVERSATION STATES ====================
 WAITING_MESSAGE = 1
@@ -206,22 +207,27 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(get_admin_commands_list(), parse_mode=ParseMode.MARKDOWN)
 
-# ==================== COMMAND HANDLER ====================
+# ==================== COMMAND HANDLER (with branding, log, long output as file) ====================
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, query: str):
     cmd_info = COMMANDS.get(cmd)
     if not cmd_info:
         await update.message.reply_text("❌ Command not found.")
         return
 
+    # ========== SPECIAL HANDLING FOR tg2num (REMOVED: username resolve) ==========
+    # Ab tg2num sirf numeric user ID accept karega.
+
     url = cmd_info["url"].format(query)
     logger.info(f"🔗 API Call: {url}")
     data = await call_api(url)
 
+    # ========== REMOVE UNWANTED FIELDS FOR tg2num ==========
     if cmd == 'tg2num' and isinstance(data, dict):
         keys_to_remove = ["credit", "channel", "validity"]
         for key in keys_to_remove:
             data.pop(key, None)
 
+    # Add branding to the JSON data
     if isinstance(data, dict):
         data["developer"] = BRANDING["developer"]
         data["powered_by"] = BRANDING["powered_by"]
@@ -238,16 +244,26 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             "powered_by": BRANDING["powered_by"]
         }
 
+    # Clean branding from original API response
     json_str = json.dumps(data, indent=2, ensure_ascii=False)
     cleaned = clean_branding(json_str, cmd_info.get("extra_blacklist", []))
     cleaned_escaped = html.escape(cleaned)
 
     extra_footer = "\n\n━━━━━━━━━━━━━━━━━━━━\n👨‍💻 <b>Developer:</b> @Nullprotocol_X\n⚡ <b>Powered by:</b> NULL PROTOCOL"
+
+    # Prepare final HTML message for user
     output_html = f"<pre>{cleaned_escaped}</pre>{extra_footer}"
 
+    # Check if output is too long
     is_long = len(output_html) > 4096 or len(cleaned) > 3000
     log_channel_id = cmd_info.get("log")
 
+    if log_channel_id:
+        logger.info(f"📢 Log channel for /{cmd}: {log_channel_id}")
+    else:
+        logger.error(f"❌ No log channel configured for /{cmd}")
+
+    # ========== HANDLE LONG OUTPUT (FILE) ==========
     if is_long:
         filename = f"{cmd}_{query[:50].replace(' ', '_')}.json"
         try:
@@ -255,6 +271,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 f.write(cleaned)
             logger.info(f"✅ File created: {filename}")
 
+            # 1. Send file to user
             with open(filename, 'rb') as f:
                 await update.message.reply_document(
                     document=f,
@@ -263,6 +280,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 )
             logger.info(f"✅ File sent to user {update.effective_user.id}")
 
+            # 2. Send same file to log channel with user info in caption (using HTML for bold)
             if log_channel_id:
                 user_info_caption = (
                     f"👤 <b>User:</b> {update.effective_user.id} (@{update.effective_user.username or 'N/A'})\n"
@@ -277,61 +295,96 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                             document=f,
                             filename=filename,
                             caption=user_info_caption,
-                            parse_mode=ParseMode.HTML
+                            parse_mode=ParseMode.HTML  # HTML for bold
                         )
-                    logger.info(f"✅ File sent to log channel {log_channel_id}")
+                    logger.info(f"✅ File sent to log channel {log_channel_id} with HTML")
                 except Exception as e:
-                    logger.error(f"❌ Log channel file send failed: {e}")
+                    logger.error(f"❌ Log channel file send failed (HTML): {e}", exc_info=True)
+                    # Try sending without parse_mode (plain caption)
                     try:
                         with open(filename, 'rb') as f:
                             await context.bot.send_document(
                                 chat_id=log_channel_id,
                                 document=f,
                                 filename=filename,
-                                caption=re.sub(r'<[^>]+>', '', user_info_caption)
+                                caption=re.sub(r'<[^>]+>', '', user_info_caption)  # strip HTML tags
                             )
+                        logger.info(f"✅ File sent to log channel (plain caption) {log_channel_id}")
                     except Exception as e2:
-                        logger.error(f"❌ Log channel plain send failed: {e2}")
+                        logger.error(f"❌ Log channel file send even plain failed: {e2}", exc_info=True)
+            else:
+                logger.warning("⚠️ No log channel, skipping file log.")
+
         except Exception as e:
-            logger.error(f"❌ File handling error: {e}")
+            logger.error(f"❌ File handling error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ File send failed: {e}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
                 logger.info(f"🗑️ File {filename} removed")
+
+    # ========== HANDLE NORMAL OUTPUT (TEXT) ==========
     else:
+        # Send to user (HTML format)
         keyboard = [[get_copy_button(data), get_search_button(cmd)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(output_html, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
         logger.info(f"✅ Text response sent to user {update.effective_user.id}")
 
+        # Send log as text message with syntax highlighting (MarkdownV2)
         if log_channel_id:
+            # Prepare JSON string for log
             json_for_log = json.dumps(data, indent=2, ensure_ascii=False)
+            # Escape special characters for MarkdownV2
             escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
             def escape_md(text):
                 for ch in escape_chars:
                     text = text.replace(ch, '\\' + ch)
                 return text
 
+            # User info (safe part, no need to escape fully but we'll do basic)
             user_info = f"👤 *User:* {update.effective_user.id} (@{escape_md(update.effective_user.username or 'N/A')})\n"
             cmd_line = f"🔍 *Command:* /{cmd}\n"
             query_line = f"📝 *Query:* `{escape_md(query)}`\n\n"
             json_block = f"```json\n{json_for_log}\n```"
+
             log_text = user_info + cmd_line + query_line + json_block
 
             try:
-                await context.bot.send_message(chat_id=log_channel_id, text=log_text, parse_mode='MarkdownV2')
-            except Exception:
+                await context.bot.send_message(
+                    chat_id=log_channel_id,
+                    text=log_text,
+                    parse_mode='MarkdownV2'
+                )
+                logger.info(f"✅ Log sent to channel {log_channel_id} with MarkdownV2")
+            except Exception as e:
+                logger.error(f"❌ MarkdownV2 send failed: {e}", exc_info=True)
+                # Fallback to Markdown (legacy)
                 try:
-                    await context.bot.send_message(chat_id=log_channel_id, text=log_text, parse_mode=ParseMode.MARKDOWN)
-                except Exception:
-                    plain_text = re.sub(r'[*_`\\[\\]]', '', log_text)
-                    await context.bot.send_message(chat_id=log_channel_id, text=plain_text)
+                    await context.bot.send_message(
+                        chat_id=log_channel_id,
+                        text=log_text,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    logger.info(f"✅ Log sent with legacy Markdown to {log_channel_id}")
+                except Exception as e2:
+                    logger.error(f"❌ Legacy Markdown also failed: {e2}", exc_info=True)
+                    # Final fallback: plain text
+                    try:
+                        plain_text = re.sub(r'[*_`\\[\\]]', '', log_text)
+                        await context.bot.send_message(chat_id=log_channel_id, text=plain_text)
+                        logger.info(f"✅ Plain text log sent to {log_channel_id}")
+                    except Exception as e3:
+                        logger.error(f"❌ Plain text also failed: {e3}", exc_info=True)
+        else:
+            logger.warning("⚠️ No log channel, skipping text log.")
 
+    # Save lookup to DB
     try:
         await save_lookup(update.effective_user.id, cmd, query, data)
+        logger.info(f"✅ Lookup saved for user {update.effective_user.id}")
     except Exception as e:
-        logger.error(f"❌ Failed to save lookup: {e}")
+        logger.error(f"❌ Failed to save lookup: {e}", exc_info=True)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await group_only(update, context):
@@ -360,6 +413,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await handle_command(update, context, cmd, query)
 
+# ==================== CALLBACK HANDLER ====================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -391,7 +445,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cmd = data.split(":", 1)[1]
         await query.message.reply_text(f"Send `/{cmd}` with your query.", parse_mode=ParseMode.MARKDOWN)
 
-# ==================== CONVERSATION HANDLERS ====================
+# ==================== CONVERSATION HANDLERS FOR BROADCAST/DM/BULKDM ====================
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != OWNER_ID and not await is_admin(user.id):
@@ -418,6 +472,7 @@ async def dm_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['dm_targets'] = [target]
     await update.message.reply_text(
         f"Send the message you want to send to {target}.\n"
+        "You can send any type: text, photo, video, document, poll, etc.\n"
         "Send /cancel to abort."
     )
     return WAITING_MESSAGE
@@ -440,6 +495,7 @@ async def bulkdm_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['bulkdm_targets'] = targets
     await update.message.reply_text(
         f"Send the message you want to send to {len(targets)} users.\n"
+        "You can send any type: text, photo, video, document, poll, etc.\n"
         "Send /cancel to abort."
     )
     return WAITING_MESSAGE
@@ -665,6 +721,7 @@ async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• **{name}**\n  ID: `{gid}`\n  Link: {link if link else 'N/A'}\n\n"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+# ==================== OWNER COMMANDS ====================
 @owner_only
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -701,6 +758,7 @@ async def full_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Backup failed: {e}")
 
+# ==================== GROUP TRACKING ====================
 async def track_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ['group', 'supergroup']:
         return
@@ -719,30 +777,45 @@ async def track_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif status == 'left':
         await remove_bot_group(chat.id)
 
-# ==================== BOT INITIALIZATION (WEBHOOK) ====================
-async def setup_webhook():
+# ==================== BOT INITIALIZATION ====================
+async def post_init(app: Application):
+    await init_db()
+    for aid in INITIAL_ADMINS:
+        await add_admin(aid, OWNER_ID)
+    logger.info("✅ Bot initialized, database ready.")
+
+def setup_bot_app():
     global bot_app
-    # Build application
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("❌ BOT_TOKEN not set!")
+        return None
+
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Add all handlers (same as before)
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_help))
 
     broadcast_conv = ConversationHandler(
         entry_points=[CommandHandler('broadcast', broadcast_start)],
-        states={WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]},
+        states={
+            WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]
+        },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     dm_conv = ConversationHandler(
         entry_points=[CommandHandler('dm', dm_start)],
-        states={WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]},
+        states={
+            WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]
+        },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     bulkdm_conv = ConversationHandler(
         entry_points=[CommandHandler('bulkdm', bulkdm_start)],
-        states={WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]},
+        states={
+            WAITING_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_message)]
+        },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     app.add_handler(broadcast_conv)
@@ -773,29 +846,12 @@ async def setup_webhook():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(ChatMemberHandler(track_groups, ChatMemberHandler.CHAT_MEMBER))
 
-    # Set webhook
-    webhook_url = WEBHOOK_URL
-    if not webhook_url:
-        logger.error("❌ WEBHOOK_URL not set in environment variables!")
-        return
-    logger.info(f"🔗 Setting webhook to: {webhook_url}")
-    await app.bot.set_webhook(url=webhook_url)
-    logger.info("✅ Webhook set successfully!")
-
-    # Store globally for Flask route
-    bot_app = app
     return app
 
-async def post_init(app: Application):
-    await init_db()
-    for aid in INITIAL_ADMINS:
-        await add_admin(aid, OWNER_ID)
-    logger.info("✅ Bot initialized, database ready.")
-
-# ==================== FLASK ROUTES ====================
+# ==================== FLASK WEBHOOK ENDPOINT ====================
 @flask_app.route('/')
 def home():
-    return jsonify({"status": "running", "message": "OSINT Pro Bot is active (webhook mode)", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "message": "OSINT Pro Bot is active", "time": datetime.now().isoformat()})
 
 @flask_app.route('/health')
 def health():
@@ -803,74 +859,100 @@ def health():
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
-    global bot_app, bot_loop
-    if not bot_app:
-        return jsonify({"error": "Bot not ready"}), 503
+    """Receive Telegram updates and feed them into the bot."""
+    global bot_app, asyncio_loop
+    if bot_app is None:
+        return "Bot not ready", 503
 
     # Get JSON data from Telegram
-    json_data = request.get_json(force=True)
+    json_data = request.get_json()
     if not json_data:
-        return jsonify({"error": "Invalid data"}), 400
+        return "Bad request", 400
 
     # Create Update object
     update = Update.de_json(json_data, bot_app.bot)
 
-    # Process update in the bot's event loop
-    if bot_loop and bot_loop.is_running():
-        asyncio.run_coroutine_threadsafe(bot_app.process_update(update), bot_loop)
-    else:
-        logger.error("Bot event loop not available")
-        return jsonify({"error": "No event loop"}), 500
+    # Schedule the update processing in the bot's asyncio loop
+    asyncio.run_coroutine_threadsafe(bot_app.process_update(update), asyncio_loop)
 
-    return 'OK', 200
+    return "OK", 200
 
-# ==================== SELF-PING MECHANISM (every 4 minutes) ====================
-def keep_alive(port):
-    """Periodically ping the health endpoint to keep Render instance alive."""
+# ==================== SELF-PING ====================
+def self_ping_worker():
+    """Background thread that pings the health endpoint every 5 minutes."""
+    # Use the public Render URL (from environment or fallback)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://grp-xk6x.onrender.com")
+    health_url = f"{render_url}/health"
+    logger.info(f"Self-ping worker started. Will ping {health_url} every 5 minutes.")
     while True:
-        time.sleep(240)  # 4 minutes (240 seconds)
         try:
-            # Ping localhost (inside container) – this counts as activity on Render
-            response = requests.get(f'http://localhost:{port}/health', timeout=10)
+            response = requests.get(health_url, timeout=10)
             if response.status_code == 200:
-                logger.debug("Self-ping successful")
+                logger.info("Self-ping successful")
             else:
-                logger.warning(f"Self-ping returned {response.status_code}")
+                logger.warning(f"Self-ping got status {response.status_code}")
         except Exception as e:
             logger.error(f"Self-ping failed: {e}")
+        time.sleep(300)  # 5 minutes
 
 # ==================== MAIN ====================
 def main():
-    logger.info("🔧 Starting OSINT Pro Bot on Render with Webhook...")
+    global bot_app, asyncio_loop
+
+    logger.info("🔧 Starting OSINT Pro Bot on Render Web Service...")
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         logger.error("❌ BOT_TOKEN not set! Please add it in Render environment variables.")
+
+    logger.warning("⚠️ SQLite database is being used. Data will be lost on every restart!")
+    logger.warning("⚠️ For production, use PostgreSQL or attach a persistent disk.")
+
+    # Create bot application
+    bot_app = setup_bot_app()
+    if bot_app is None:
+        logger.error("Failed to create bot application. Exiting.")
         return
 
-    if not WEBHOOK_URL:
-        logger.error("❌ WEBHOOK_URL not set! Please set it in Render environment variables.")
-        return
-
-    # Start bot webhook setup in a separate thread (to keep Flask main thread free)
-    def start_bot_thread():
+    # Start the bot's asyncio loop in a background thread
+    def run_bot_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        global bot_loop
-        bot_loop = loop
-        loop.run_until_complete(setup_webhook())
-        # Keep the loop alive forever
-        loop.run_forever()
+        global asyncio_loop
+        asyncio_loop = loop
+        try:
+            # Initialize and start the application (no polling)
+            loop.run_until_complete(bot_app.initialize())
+            loop.run_until_complete(bot_app.start())
+            logger.info("✅ Bot application started (no polling).")
+            loop.run_forever()
+        except Exception as e:
+            logger.exception(f"Bot loop crashed: {e}")
+        finally:
+            loop.close()
 
-    bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
+    bot_thread = threading.Thread(target=run_bot_loop, daemon=True)
     bot_thread.start()
-    logger.info("✅ Bot webhook setup thread started")
+    logger.info("Bot thread started")
 
-    # Start self-ping thread (every 4 minutes)
-    port = int(os.environ.get("PORT", 5000))
-    ping_thread = threading.Thread(target=keep_alive, args=(port,), daemon=True)
+    # Set webhook after bot is ready (give it a few seconds)
+    time.sleep(2)
+    webhook_url = f"https://grp-xk6x.onrender.com/webhook"  # Your Render URL
+    set_webhook_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    try:
+        resp = requests.post(set_webhook_url, data={"url": webhook_url})
+        if resp.status_code == 200:
+            logger.info(f"✅ Webhook set to {webhook_url}")
+        else:
+            logger.error(f"❌ Failed to set webhook: {resp.text}")
+    except Exception as e:
+        logger.error(f"❌ Error setting webhook: {e}")
+
+    # Start self-ping thread
+    ping_thread = threading.Thread(target=self_ping_worker, daemon=True)
     ping_thread.start()
-    logger.info("✅ Self-ping thread started (every 4 minutes)")
+    logger.info("Self-ping thread started")
 
     # Start Flask server (main thread)
+    port = int(os.environ.get("PORT", 5000))
     logger.info(f"🌐 Flask server starting on port {port}")
     flask_app.run(host="0.0.0.0", port=port)
 
